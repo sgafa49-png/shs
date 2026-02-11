@@ -59,9 +59,29 @@ async def get_user(user_id):
     async with db_pool.acquire() as conn:
         return await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
 
-async def get_user_by_username(username):
+async def get_user_by_username(username, context=None):
+    # Сначала ищем в БД
     async with db_pool.acquire() as conn:
-        return await conn.fetchrow("SELECT * FROM users WHERE username ILIKE $1", username)
+        user = await conn.fetchrow("SELECT * FROM users WHERE username ILIKE $1", username)
+    
+    # Если нашли в БД - возвращаем
+    if user:
+        return user
+    
+    # Если не нашли и есть context - пробуем найти через Telegram API
+    if context:
+        try:
+            chat = await context.bot.get_chat(f"@{username}")
+            if chat:
+                # Создаем пользователя в БД
+                await create_user(chat.id, chat.username or username)
+                # Возвращаем свежесозданного пользователя
+                async with db_pool.acquire() as conn:
+                    return await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", chat.id)
+        except Exception as e:
+            print(f"Не удалось найти пользователя @{username} в Telegram: {e}")
+    
+    return None
 
 async def create_user(user_id, username):
     async with db_pool.acquire() as conn:
@@ -403,7 +423,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if target.isdigit():
                     user_data = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", int(target))
                 else:
-                    user_data = await conn.fetchrow("SELECT * FROM users WHERE username ILIKE $1", target)
+                    user_data = await get_user_by_username(target, context)
 
             if not user_data:
                 await update.message.reply_text("<b>🚫 Пользователь не найден</b>", parse_mode="HTML")
@@ -442,6 +462,105 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(profile_text, parse_mode="HTML", reply_markup=reply_markup)
 
         return
+
+    # ===== ЛИЧКА =====
+    if chat_type == "private":
+        if text:
+            if state == "awaiting_find_username":
+                target = text.lower().replace("@", "")
+
+                if target.isdigit():
+                    user = await get_user(int(target))
+                else:
+                    user = await get_user_by_username(target, context)
+
+                if user:
+                    total = user["positive"] + user["negative"]
+                    if total > 0:
+                        positive_percent = (user["positive"] / total * 100)
+                        negative_percent = (user["negative"] / total * 100)
+                    else:
+                        positive_percent = 0.0
+                        negative_percent = 0.0
+                    reg_date = user["registered"].strftime("%d %B %Y года.")
+
+                    profile_text = (
+                        f"👤 @{user['username']} (ID: {user['user_id']})\n\n"
+                        f"<blockquote>🏆 {user['positive']} шт. · {positive_percent:.1f}% положительных · {negative_percent:.1f}% отрицательных\n"
+                        f"🛡 {user['total_deals']} шт. • {user['deal_sum']} RUB сумма сделок</blockquote>\n\n"
+                        f"ВНИМАТЕЛЬНО СМОТРИТЕ ПОЛЕ «О СЕБЕ» ‼️\n\n"
+                        f"💳 Депозит: отсутствует\n\n"
+                        f"📆 Зарегистрирован {reg_date}"
+                    )
+                    await update.message.reply_text(profile_text, parse_mode="HTML", reply_markup=get_profile_reviews_button(user['user_id']))
+                else:
+                    await update.message.reply_text("<b>🚫 Пользователь не найден</b>", parse_mode="HTML", reply_markup=get_back_button())
+
+                context.user_data["state"] = None
+
+            elif state == "awaiting_send_rep_username":
+                target = text.lower().replace("@", "")
+
+                if target.isdigit():
+                    user = await get_user(int(target))
+                else:
+                    user = await get_user_by_username(target, context)
+
+                if user:
+                    await create_user(user['user_id'], user['username'])
+                    context.user_data["target_user"] = user['user_id']
+                    context.user_data["target_username"] = user['username']
+                    context.user_data["state"] = "awaiting_rep_text"
+                    await update.message.reply_text(
+                        f"✅ Пользователь @{user['username']} выбран. Теперь отправьте сообщение с +реп или -реп",
+                        parse_mode="HTML",
+                        reply_markup=get_back_button()
+                    )
+                else:
+                    await update.message.reply_text("<b>🚫 Пользователь не найден</b>", parse_mode="HTML", reply_markup=get_back_button())
+                    context.user_data["state"] = None
+
+            elif state == "awaiting_rep_text":
+                target_user_id = context.user_data.get("target_user")
+                target_username = context.user_data.get("target_username")
+
+                if not target_user_id:
+                    await update.message.reply_text("<b>🚫 Ошибка: выберите пользователя сначала</b>", parse_mode="HTML", reply_markup=get_back_button())
+                    context.user_data["state"] = None
+                    return
+
+                rep_pattern = r'[\+\-]\s*[РрRr][ЕеEe][ПпPp]\b'
+                has_rep = re.search(rep_pattern, text)
+
+                if not has_rep:
+                    await update.message.reply_text("<b>🚫 В сообщении должен быть +реп или -реп</b>", parse_mode="HTML", reply_markup=get_back_button())
+                    return
+
+                if not update.message.photo:
+                    await update.message.reply_text(
+                        "<b>🚫 Прикрепите фото</b>",
+                        parse_mode="HTML"
+                    )
+                    return
+
+                rep_type = '+' if '+' in has_rep.group() else '-'
+                photo_id = update.message.photo[-1].file_id if update.message.photo else None
+
+                if target_user_id != user_id:
+                    await update_reputation(target_user_id, user_id, rep_type, text, photo_id)
+                    await update.message.reply_text(
+                        "<b>✅ Репутация сохранена</b>",
+                        parse_mode="HTML"
+                    )
+                else:
+                    await update.message.reply_text(
+                        "<b>🚫 Нельзя отправить репутацию самому себе</b>",
+                        parse_mode="HTML"
+                    )
+
+                context.user_data.pop("target_user", None)
+                context.user_data.pop("target_username", None)
+                context.user_data["state"] = None
 
     # ===== ПАРСИНГ РЕПУТАЦИИ С ЗАЩИТОЙ ОТ РЕКЛАМЫ =====
     if text:
@@ -499,7 +618,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if str(target_username).isdigit():
                         target_user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", int(target_username))
                     else:
-                        target_user = await conn.fetchrow("SELECT * FROM users WHERE username ILIKE $1", target_username)
+                        target_user = await get_user_by_username(target_username, context)
 
                 if not target_user:
                     await update.message.reply_text("<b>🚫 Пользователь не найден</b>", parse_mode="HTML")
