@@ -443,15 +443,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # ===== ПАРСИНГ РЕПУТАЦИИ =====
+    # ===== ПАРСИНГ РЕПУТАЦИИ С ЗАЩИТОЙ ОТ РЕКЛАМЫ =====
     if text:
         mention_pattern = r'@(\w+)|(\b\d{5,}\b)'
-        rep_pattern = r'[\+\-]\s*[РрRr][ЕеEe][ПпPp]'
-
+        rep_pattern = r'[\+\-]\s*[РрRr][ЕеEe][ПпPp]\b'
+        
         mentions = re.findall(mention_pattern, text)
         has_rep = re.search(rep_pattern, text)
+        
+        # ===== АНТИСПАМ: проверка на рекламу =====
+        ad_keywords = ['купить', 'продаю', 'цены', 'оплата', 'баланс', 'карты', 'услуги', 'скам', 'принимаю', 'пушкинские']
+        self_promo = ['у меня', 'моя', 'мои', 'моё', 'на мне', 'с меня']
+        
+        is_ad = False
+        lower_text = text.lower()
+        
+        for keyword in ad_keywords:
+            if keyword in lower_text:
+                is_ad = True
+                break
+                
+        for promo in self_promo:
+            if promo in lower_text:
+                is_ad = True
+                break
+        
+        # Проверка на цифры перед +реп (500+реп)
+        if re.search(r'\d+\s*[\+\-]\s*[рp][еe][пp]', lower_text):
+            is_ad = True
 
-        if mentions and has_rep and state != "awaiting_rep_text":
+        if mentions and has_rep and state != "awaiting_rep_text" and not is_ad:
             if not update.message.photo:
                 await update.message.reply_text(
                     "<b>🚫 Прикрепите фото</b>",
